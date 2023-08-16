@@ -80,14 +80,11 @@
 const char *config_roots[] = { "/usr/lib", "/etc" };
 #define PREPARE_ROOT_CONFIG_PATH "ostree/prepare-root.conf"
 
-#define DEFAULT_KEYPATH "/etc/ostree/initramfs-root-binding.key"
-
 #define SYSROOT_KEY "sysroot"
 #define READONLY_KEY "readonly"
 
-#define COMPOSEFS_KEY "composefs"
-#define ENABLED_KEY "enabled"
-#define KEYPATH_KEY "keypath"
+// The kernel argument we support to configure composefs.
+#define OT_COMPOSEFS_KARG "ot-composefs"
 
 #define OSTREE_PREPARE_ROOT_DEPLOYMENT_MSG \
   SD_ID128_MAKE (71, 70, 33, 6a, 73, ba, 46, 01, ba, d3, 1a, f8, 88, aa, 0d, f7)
@@ -205,11 +202,13 @@ static GVariant *
 load_variant (const char *root_mountpoint, const char *digest, const char *extension,
               const GVariantType *type, GError **error)
 {
-  g_autofree char *path = g_strdup_printf ("%s/ostree/repo/objects/%.2s/%s.%s", root_mountpoint,
-                                           digest, digest + 2, extension);
-
+  g_autofree char *path = NULL;
   char *data = NULL;
   gsize data_size;
+
+  path = g_strdup_printf ("%s/ostree/repo/objects/%.2s/%s.%s", root_mountpoint, digest, digest + 2,
+                          extension);
+
   if (!g_file_get_contents (path, &data, &data_size, error))
     return NULL;
 
@@ -222,7 +221,9 @@ load_commit_for_deploy (const char *root_mountpoint, const char *deploy_path, GV
 {
   g_autoptr (GError) local_error = NULL;
   g_autofree char *digest = g_path_get_basename (deploy_path);
-  char *dot = strchr (digest, '.');
+  char *dot;
+
+  dot = strchr (digest, '.');
   if (dot != NULL)
     *dot = 0;
 
@@ -249,29 +250,21 @@ load_commit_for_deploy (const char *root_mountpoint, const char *deploy_path, GV
 }
 
 static gboolean
-validate_signature (GBytes *data, GVariant *signatures, GPtrArray *pubkeys)
+validate_signature (GBytes *data, GVariant *signatures, const guchar *pubkey, size_t pubkey_size)
 {
-  g_assert (data);
-  g_assert (signatures);
-  g_assert (pubkeys);
+  g_autoptr (GBytes) pubkey_buf = g_bytes_new_static (pubkey, pubkey_size);
 
-  for (gsize j = 0; j < pubkeys->len; j++)
+  for (gsize i = 0; i < g_variant_n_children (signatures); i++)
     {
-      GBytes *pubkey = pubkeys->pdata[j];
-      g_assert (pubkey);
+      g_autoptr (GError) local_error = NULL;
+      g_autoptr (GVariant) child = g_variant_get_child_value (signatures, i);
+      g_autoptr (GBytes) signature = g_variant_get_data_as_bytes (child);
+      bool valid = false;
 
-      for (gsize i = 0; i < g_variant_n_children (signatures); i++)
-        {
-          g_autoptr (GError) local_error = NULL;
-          g_autoptr (GVariant) child = g_variant_get_child_value (signatures, i);
-          g_autoptr (GBytes) signature = g_variant_get_data_as_bytes (child);
-          bool valid = false;
-
-          if (!otcore_validate_ed25519_signature (data, pubkey, signature, &valid, &local_error))
-            errx (EXIT_FAILURE, "signature verification failed: %s", local_error->message);
-          if (valid)
-            return TRUE;
-        }
+      if (!otcore_validate_ed25519_signature (data, pubkey_buf, signature, &valid, &local_error))
+        errx (EXIT_FAILURE, "signature verification failed: %s", local_error->message);
+      if (valid)
+        return TRUE;
     }
 
   return FALSE;
@@ -281,79 +274,79 @@ validate_signature (GBytes *data, GVariant *signatures, GPtrArray *pubkeys)
 typedef struct
 {
   OtTristate enabled;
-  gboolean is_signed;
   char *signature_pubkey;
-  GPtrArray *pubkeys;
+  char *expected_digest;
 } ComposefsConfig;
 
 static void
 free_composefs_config (ComposefsConfig *config)
 {
-  g_ptr_array_unref (config->pubkeys);
   free (config->signature_pubkey);
+  free (config->expected_digest);
   free (config);
 }
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (ComposefsConfig, free_composefs_config)
 
 static ComposefsConfig *
-load_composefs_config (GKeyFile *config, GError **error)
+load_composefs_config (GError **error)
 {
   GLNX_AUTO_PREFIX_ERROR ("Loading composefs config", error);
-
   g_autoptr (ComposefsConfig) ret = g_new0 (ComposefsConfig, 1);
+  ret->enabled = OT_TRISTATE_MAYBE;
 
-  g_autofree char *enabled = g_key_file_get_value (config, COMPOSEFS_KEY, ENABLED_KEY, NULL);
-  if (g_strcmp0 (enabled, "signed") == 0)
+  // TODO: Drop this kernel argument in favor of just the config file in the initramfs
+  autofree char *ot_composefs = read_proc_cmdline_key (OT_COMPOSEFS_KARG);
+  if (ot_composefs)
     {
-      ret->enabled = OT_TRISTATE_YES;
-      ret->is_signed = true;
-    }
-  else if (!ot_keyfile_get_tristate_with_default (config, COMPOSEFS_KEY, ENABLED_KEY,
-                                                  OT_TRISTATE_MAYBE, &ret->enabled, error))
-    return NULL;
-
-  if (!ot_keyfile_get_value_with_default (config, COMPOSEFS_KEY, KEYPATH_KEY, DEFAULT_KEYPATH,
-                                          &ret->signature_pubkey, error))
-    return NULL;
-
-  if (ret->is_signed)
-    {
-      ret->pubkeys = g_ptr_array_new_with_free_func ((GDestroyNotify)g_bytes_unref);
-
-      g_autofree char *pubkeys = NULL;
-      gsize pubkeys_size;
-
-      /* Load keys */
-
-      if (!g_file_get_contents (ret->signature_pubkey, &pubkeys, &pubkeys_size, error))
-        return glnx_prefix_error_null (error, "Reading public key file '%s'",
-                                       ret->signature_pubkey);
-
-      /* Raw binary form if right size */
-      if (pubkeys_size == OSTREE_SIGN_ED25519_PUBKEY_SIZE)
-        g_ptr_array_add (ret->pubkeys, g_bytes_new_take (g_steal_pointer (&pubkeys), pubkeys_size));
-      else /* otherwise text with base64 key per line */
+      if (strcmp (ot_composefs, "off") == 0)
+        ret->enabled = OT_TRISTATE_NO;
+      else if (strcmp (ot_composefs, "maybe") == 0)
+        ret->enabled = OT_TRISTATE_MAYBE;
+      else if (strcmp (ot_composefs, "on") == 0)
+        ret->enabled = OT_TRISTATE_YES;
+      else if (g_str_has_prefix (ot_composefs, "signed="))
         {
-          g_auto (GStrv) lines = g_strsplit (pubkeys, "\n", -1);
-          for (char **iter = lines; *iter; iter++)
-            {
-              const char *line = *iter;
-              if (!*line)
-                continue;
-
-              gsize pubkey_size;
-              g_autofree guchar *pubkey = g_base64_decode (line, &pubkey_size);
-              g_ptr_array_add (ret->pubkeys,
-                               g_bytes_new_take (g_steal_pointer (&pubkey), pubkey_size));
-            }
+          ret->enabled = OT_TRISTATE_YES;
+          ret->signature_pubkey = g_strdup (ot_composefs + strlen ("signed="));
         }
-
-      if (ret->pubkeys->len == 0)
-        return glnx_null_throw (error, "public key file specified, but no public keys found");
+      else if (g_str_has_prefix (ot_composefs, "digest="))
+        {
+          ret->enabled = OT_TRISTATE_YES;
+          ret->expected_digest = g_strdup (ot_composefs + strlen ("digest="));
+        }
+      else
+        return glnx_null_throw (error, "Unsupported %s option: '%s'", OT_COMPOSEFS_KARG,
+                                ot_composefs);
+      // In theory it's OK to have both a signature and an expected digest,
+      // but since there's no valid reason to do both, let's not support it.
+      g_assert (!(ret->signature_pubkey && ret->expected_digest));
     }
 
   return g_steal_pointer (&ret);
+}
+
+static gboolean
+copy_selinux_context (const char *src_path, const char *dst_path, GError **error)
+{
+  ssize_t bytes_read, real_size;
+
+  if (TEMP_FAILURE_RETRY (bytes_read = lgetxattr (src_path, "security.selinux", NULL, 0)) < 0)
+    {
+      if (errno == ENODATA || errno == ENOTSUP)
+        return TRUE; /* no selinux context, we're done */
+      return glnx_throw_errno_prefix (error, "lgetxattr(security.selinux)");
+    }
+
+  g_autofree guint8 *buf = g_malloc (bytes_read);
+  if (TEMP_FAILURE_RETRY (real_size = lgetxattr (src_path, "security.selinux", buf, bytes_read))
+      < 0)
+    return glnx_throw_errno_prefix (error, "lgetxattr(security.selinux)");
+
+  if (lsetxattr (dst_path, "security.selinux", buf, real_size, 0) < 0)
+    return glnx_throw_errno_prefix (error, "lsetxattr(security.selinux)");
+
+  return TRUE;
 }
 
 int
@@ -361,11 +354,13 @@ main (int argc, char *argv[])
 {
   char srcpath[PATH_MAX];
   struct stat stbuf;
+
+  const char *root_arg = NULL;
   g_autoptr (GError) error = NULL;
 
   if (argc < 2)
     err (EXIT_FAILURE, "usage: ostree-prepare-root SYSROOT");
-  const char *root_arg = argv[1];
+  root_arg = argv[1];
 
   g_autoptr (GKeyFile) config = load_config (&error);
   if (!config)
@@ -375,7 +370,7 @@ main (int argc, char *argv[])
 
   // We always parse the composefs config, because we want to detect and error
   // out if it's enabled, but not supported at compile time.
-  g_autoptr (ComposefsConfig) composefs_config = load_composefs_config (config, &error);
+  g_autoptr (ComposefsConfig) composefs_config = load_composefs_config (&error);
   if (!composefs_config)
     errx (EXIT_FAILURE, "%s", error->message);
 
@@ -453,14 +448,21 @@ main (int argc, char *argv[])
         1,
       };
 
-      g_autofree char *expected_digest = NULL;
-
-      if (composefs_config->is_signed)
+      g_autofree char *expected_digest_owned = NULL;
+      const char *expected_digest = expected_digest_owned;
+      if (composefs_config->signature_pubkey)
         {
+          g_assert (expected_digest == NULL);
           const char *composefs_pubkey = composefs_config->signature_pubkey;
           g_autoptr (GError) local_error = NULL;
+          g_autofree char *pubkey = NULL;
+          gsize pubkey_size;
           g_autoptr (GVariant) commit = NULL;
           g_autoptr (GVariant) commitmeta = NULL;
+
+          if (!g_file_get_contents (composefs_pubkey, &pubkey, &pubkey_size, &local_error))
+            errx (EXIT_FAILURE, "Failed to load public key '%s': %s", composefs_pubkey,
+                  local_error->message);
 
           if (!load_commit_for_deploy (root_mountpoint, deploy_path, &commit, &commitmeta,
                                        &local_error))
@@ -472,7 +474,7 @@ main (int argc, char *argv[])
             errx (EXIT_FAILURE, "Signature validation requested, but no signatures in commit");
 
           g_autoptr (GBytes) commit_data = g_variant_get_data_as_bytes (commit);
-          if (!validate_signature (commit_data, signatures, composefs_config->pubkeys))
+          if (!validate_signature (commit_data, signatures, (guchar *)pubkey, pubkey_size))
             errx (EXIT_FAILURE, "No valid signatures found for public key");
 
           g_print ("composefs+ostree: Validated commit signature using '%s'\n", composefs_pubkey);
@@ -489,8 +491,9 @@ main (int argc, char *argv[])
           if (!cfs_digest_buf)
             errx (EXIT_FAILURE, "Failed to query digest: %s", error->message);
 
-          expected_digest = g_malloc (OSTREE_SHA256_STRING_LEN + 1);
-          ot_bin2hex (expected_digest, cfs_digest_buf, g_variant_get_size (cfs_digest_v));
+          expected_digest_owned = g_malloc (OSTREE_SHA256_STRING_LEN + 1);
+          ot_bin2hex (expected_digest_owned, cfs_digest_buf, g_variant_get_size (cfs_digest_v));
+          expected_digest = expected_digest_owned;
         }
 
       cfs_options.flags = LCFS_MOUNT_FLAGS_READONLY;
@@ -509,7 +512,7 @@ main (int argc, char *argv[])
           // If we're not verifying a digest, then we *must* also have signatures disabled.
           // Or stated in reverse: if signature verification is enabled, then digest verification
           // must also be.
-          g_assert (!composefs_config->is_signed);
+          g_assert (!composefs_config->signature_pubkey);
           g_print ("composefs: Mounting with no digest or signature check\n");
         }
 
@@ -646,6 +649,18 @@ main (int argc, char *argv[])
         err (EXIT_FAILURE, "failed to prepare /var bind-mount at %s", srcpath);
       if (mount ("../../var", "../../var", NULL, MS_BIND | MS_REMOUNT | MS_SILENT, NULL) < 0)
         err (EXIT_FAILURE, "failed to make writable /var bind-mount at %s", srcpath);
+
+      if (mkdirat (AT_FDCWD, "/inplace", 0731) < 0)
+        err (EXIT_FAILURE, "Failed to create %s", "/inplace");
+      if (mkdirat (AT_FDCWD, "/inplace/var", 0731) < 0)
+        err (EXIT_FAILURE, "Failed to create %s", "/inplace/var");
+
+      g_autoptr (GError) local_error = NULL;
+      if (!copy_selinux_context ("../../var", "/inplace/var", &local_error))
+        err (EXIT_FAILURE, "failed to copy /var selinux label: %s", local_error->message);
+
+      if (mount ("../../var", "/inplace/var", NULL, MS_BIND | MS_SILENT, NULL) < 0)
+        err (EXIT_FAILURE, "failed to bind mount ../../var to /inplace/var");
     }
 
     /* When running under systemd, /var will be handled by a 'var.mount' unit outside
